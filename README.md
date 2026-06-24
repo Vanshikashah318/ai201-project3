@@ -190,17 +190,19 @@ A well-constructed analysis post: specific verifiable stat (54%), historical com
 
 ## Sample Classifications
 
-The following examples were run through the fine-tuned model with confidence scores:
+The following examples were run through the fine-tuned model. All are **correct** predictions, shown with their confidence scores:
 
 | Post (truncated) | True Label | Predicted | Confidence |
 |---|---|---|---|
-| "Bumrah has taken 5+ wickets 8 times in Tests. Greatest Indian fast bowler ever." | hot_take | hot_take | 0.71 |
-| "Root has scored more Test runs than Ponting. At his current average he'll finish with 14000+..." | analysis | analysis | 0.68 |
-| "CATCH HIM! YES! OUT! The crowd is going absolutely mental." | reaction | hot_take | 0.61 |
-| "Anderson averaged 26 at home versus 32 away. Home record flatters the legacy." | hot_take | analysis | 0.59 |
-| "T20 cricket has completely ruined an entire generation of batters. Change my mind." | hot_take | hot_take | 0.77 |
+| "Virat Kohli in SENA countries since 2020 is just not the same player. The aura is gone." | hot_take | hot_take | 0.36 |
+| "Every spinner struggles in Australia. The bounce and carry just does not suit slow bowling. Ashwin's record there is bad but it proves nothing about his quality." | analysis | analysis | 0.39 |
+| "The ICC needs to do more to protect Test cricket. They clearly do not care." | hot_take | hot_take | 0.36 |
+| "Rohit's ODI average of 49 is inflated by unbeaten innings. His adjusted average accounting for not outs is closer to 43 which is still great but not the outlier people claim." | analysis | analysis | 0.41 |
+| "Ashwin averages 24 with the ball in home Tests and 32 away. The gap is real but 32 away for a spinner is still very good by historical standards — Warne averaged 27 away, Murali 28." | analysis | analysis | 0.41 |
 
-**On the correct prediction:** The model correctly identified *"T20 cricket has completely ruined an entire generation of batters"* as `hot_take` with 0.77 confidence. This is reasonable — the post has no evidence, uses sweeping language ("completely ruined", "entire generation"), and ends with a debate invitation ("change my mind"). These are strong surface features of the hot_take class that the model has learned to detect.
+**On a correct prediction:** The model correctly identified *"Ashwin averages 24 with the ball in home Tests and 32 away..."* as `analysis` with 0.41 confidence. This is reasonable — the post cites specific verifiable statistics (24 home, 32 away), draws a historical comparison to other spinners (Warne 27, Murali 28), and reasons toward a measured conclusion rather than asserting one. These are exactly the structural features of the analysis class.
+
+Note that even the correct predictions sit at low confidence (0.35–0.41), barely above the 0.33 random baseline for a three-class problem. The model gets these right but is never *confident* about them — consistent with the uniformly low confidence seen across the wrong predictions.
 
 ---
 
