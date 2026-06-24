@@ -1,306 +1,248 @@
-# FitFindr 🛍️
+# Cricket Discourse Classifier
 
-FitFindr is a secondhand-shopping agent. You describe a piece you want — with an
-optional size and price cap — and the agent finds the best matching listing, styles
-it against your wardrobe, and writes a shareable Instagram-style "fit card" caption
-for the finished look. It runs as a Gradio web app with three output panels: the
-listing it found, an outfit idea, and the fit card.
-
-```
-pip install -r requirements.txt
-# add GROQ_API_KEY=your_key_here to a .env file (free key at console.groq.com)
-python app.py
-```
-
-Then open the URL printed in your terminal. It is usually
-`http://localhost:7860`, but **check the terminal output** — the port may differ if
-7860 is taken.
+A fine-tuned text classifier that labels cricket community posts as **analysis**, **hot_take**, or **reaction** — three discourse modes that reflect how cricket fans actually talk about the game.
 
 ---
 
-## Tool Inventory
+## Community and Task
 
-The agent uses three tools, each a standalone function in [tools.py](tools.py). No tool
-calls another tool directly — they communicate only through the session dict (see
-[State Management](#state-management)).
+**Community:** A general cricket discussion community on Reddit covering all formats, teams, and international fanbases. The discourse is unusually varied: a single thread might contain a detailed tactical breakdown, a furious emotional reaction to a dropped catch, and a provocative player ranking with zero supporting evidence.
 
-### 1. `search_listings`
-
-- **Inputs:**
-  - `description` (`str`) — keywords describing the wanted item, e.g. `"vintage graphic tee"`. Matched against each listing's `style_tags`, `title`, `description`, and `category`.
-  - `size` (`str | None`) — size to filter by, e.g. `"M"`. Case-insensitive substring match (`"M"` matches `"S/M"`). `None` skips the size filter.
-  - `max_price` (`float | None`) — inclusive price ceiling. `None` skips the price filter.
-- **Output:** `list[dict]` — matching listing dicts sorted by relevance (most keyword overlap first). Each dict has `id`, `title`, `description`, `category`, `style_tags`, `size`, `condition`, `price`, `colors`, `brand`, `platform`. Returns `[]` when nothing matches — never raises.
-- **Purpose:** Turn a free-text query into a ranked shortlist of real listings. This is the only tool that touches the dataset; it is the gatekeeper that decides whether the rest of the loop runs at all.
-- **Example call:**
-  ```python
-  >>> results = search_listings("vintage graphic tee", None, 30.0)
-  >>> len(results)
-  20
-  >>> results[0]["title"], results[0]["price"], results[0]["platform"], results[0]["size"]
-  ('Graphic Tee — 2003 Tour Bootleg Style', 24.0, 'depop', 'L')
-  ```
-
-### 2. `suggest_outfit`
-
-- **Inputs:**
-  - `new_item` (`dict`) — a single listing dict from `search_listings` (uses `title`, `category`, `style_tags`, `colors`, `description`).
-  - `wardrobe` (`dict`) — the user's wardrobe, a dict with an `items` list. May be empty.
-- **Output:** `str` — a non-empty styling suggestion. If the wardrobe has items, it names specific wardrobe pieces and explains why they pair well. If the wardrobe is empty, it gives general styling advice anchored to the new item only.
-- **Purpose:** Make the listing actionable. Instead of "here's a tee," it tells the user *how to wear it* using clothes they already own. Calls the Groq LLM (`llama-3.3-70b-versatile`).
-- **Example call:**
-  ```python
-  >>> suggest_outfit(results[0], get_example_wardrobe())
-  'You should totally pair the Graphic Tee with your baggy straight-leg jeans and
-   black combat boots for a sick grunge-inspired look. The faded graphic on the tee
-   will match perfectly with the vintage vibes of the jeans and boots. Alternatively,
-   you could also wear it with your wide-leg khaki trousers and chunky white sneakers
-   for a more laid-back, streetwear look...'
-  ```
-  (It pulls the named pieces — *baggy straight-leg jeans*, *black combat boots*, *wide-leg khaki trousers*, *chunky white sneakers* — straight from the example wardrobe.)
-
-### 3. `create_fit_card`
-
-- **Inputs:**
-  - `outfit` (`str`) — the full string returned by `suggest_outfit`.
-  - `new_item` (`dict`) — the listing dict, used to pull `title`, `price`, and `platform` into the caption.
-- **Output:** `str` — a short (2–4 sentence) Instagram-style caption that mentions the item, price, and platform and sounds like a real OOTD post, not a product description. Varies per input.
-- **Purpose:** Give the user something they'd actually post. It's the payoff step that turns a search result + styling note into shareable content. Calls the Groq LLM (`llama-3.3-70b-versatile`).
-- **Example call:**
-  ```python
-  >>> create_fit_card(outfit, results[0])
-  'Thrifted this sick Graphic Tee from depop for $24, and it's giving me total grunge
-   vibes when paired with baggy jeans and combat boots. The faded graphic adds to the
-   vintage feel, perfect for a laid-back day out. This tee is so versatile, but for
-   now, it's all about the grunge 🖤'
-  ```
-  (Item title, price, and platform are woven in naturally; the caption varies on each call thanks to `temperature=0.9`.)
+**Task:** Given a post or comment from online cricket discussion threads, classify it into one of three labels that capture meaningful differences in discourse quality and intent.
 
 ---
 
-## Planning Loop
+## Label Taxonomy
 
-The loop lives in `run_agent()` in [agent.py](agent.py) and runs **once per query**. It is
-not an open-ended ReAct loop — it is a fixed sequence with one decision point that can
-cut the run short. The interesting part is not *which* tools exist but *what the agent
-decides between each step*.
+| Label | Definition |
+|---|---|
+| `analysis` | A structured argument supported by specific, verifiable evidence — statistics, historical comparisons, tactical observations. The post reasons toward a conclusion. |
+| `hot_take` | A bold, confident opinion stated without supporting evidence. Asserts rather than argues. May be provocative. A single cherry-picked stat with no surrounding reasoning also counts as hot_take. |
+| `reaction` | An immediate emotional response to a specific recent event — a wicket, a score update, a selection announcement. Expresses feeling in the moment. No argument. |
 
-**Step 1 — Initialize state.** `_new_session()` builds a session dict that is the single
-source of truth for the run.
+### Edge Case Decision Rules
 
-**Step 2 — Parse the query.** Regex pulls a price cap (a number after `under` / `$`) and a
-size (after `size`) out of the raw text, then strips those phrases so what's left is a
-clean `description`. Each parsed field is written into `session["parsed"]`. *Decision:* if
-no price or size is found, those filters stay `None` and are simply skipped downstream —
-the agent does not ask the user to clarify.
+These rules were written before annotation and applied consistently throughout:
 
-**Step 3 — `search_listings(description, size, max_price)`.** This is the loop's one branch
-point. **If the result is empty,** the agent writes a specific recovery message into
-`session["error"]` and **returns immediately** — it does *not* call `suggest_outfit` or
-`create_fit_card`, because there is no item to style or caption. This is a deliberate
-decision: better to tell the user how to broaden their search than to invent an outfit
-for a product that doesn't exist. **If results exist,** the agent picks `results[0]` (the
-highest-scoring match) as `selected_item` and continues.
-
-**Step 4 — `suggest_outfit(selected_item, wardrobe)`.** This step *never* stops the loop.
-The decision here is about *what kind* of advice to give, made inside the tool: an empty
-wardrobe yields generic styling advice; a populated wardrobe yields advice that names
-specific owned pieces. Either way a non-empty string comes back and the loop proceeds.
-
-**Step 5 — `create_fit_card(outfit, selected_item)`.** Also never stops the loop. *Decision:*
-if the outfit string is missing or blank, the tool skips the LLM entirely and returns a
-safe fallback caption built from the item's `title`/`price`/`platform`, so the user never
-sees an empty panel.
-
-**Step 6 — Return the session.** [app.py](app.py) reads `selected_item`, the runner-up
-(`search_results[1]` if present), `outfit_suggestion`, and `fit_card` out of the session
-and maps them to the three output panels.
-
-In short: the loop is linear, **search is the only gate**, and the two LLM tools are
-designed to always produce *something* usable rather than ever failing the run.
+- **One-stat hot take:** A post citing a single stat to support an aggressive conclusion, with no surrounding reasoning, is `hot_take` not `analysis`.
+- **Vague evidence:** Phrases like "the numbers show" or "the stats back it up" with no actual numbers cited = `hot_take`.
+- **Reaction anchor:** If a post would make no sense without knowing a specific recent event, it is `reaction` — even if it includes a brief complaint.
+- **Reaction-to-claim pivot:** If a post is triggered by an event but pivots into a sustained unsupported claim, classify by where it ends up — `hot_take`.
 
 ---
 
-## State Management
+## Data Collection
 
-All information moves through one **session dict** created at the start of `run_agent()`
-([agent.py](agent.py)). Tools never call each other and the user never re-enters anything
-mid-run; every value is written to the session by the loop and read back by the loop.
+**Source:** Various Reddit cricket discussion threads — including player ranking debates, match threads, trivia threads, and unpopular opinion posts.
 
-```python
-{
-    "query": str,              # original user query
-    "parsed": dict,            # {description, size, max_price} from Step 2
-    "search_results": list,    # full ranked list from search_listings
-    "selected_item": dict,     # search_results[0], fed into suggest_outfit
-    "wardrobe": dict,          # loaded once, reused all run
-    "outfit_suggestion": str,  # output of suggest_outfit, fed into create_fit_card
-    "fit_card": str,           # output of create_fit_card
-    "error": str | None,       # set only when the run stops early
-}
-```
+**Collection method:** Manual copy-paste with Claude (claude-sonnet-4-6) used to pre-label batches of 10–15 posts at a time. Every pre-assigned label was reviewed and corrected before being added to the dataset. Synthetic examples (marked SYNTHETIC in the notes column) were generated by Claude for underrepresented classes, particularly `reaction`. Edge cases (marked EDGE CASE) were deliberately constructed to sit at label boundaries to stress-test the model.
 
-How data flows:
+**Dataset size:** 200 examples
 
-- **query → `search_listings`:** the loop parses the raw query into `session["parsed"]` and passes those three values as arguments. The raw message is never handed to a tool.
-- **`search_listings` → `suggest_outfit`:** `results[0]` is stored as `session["selected_item"]` and passed in as `new_item`. The user never re-describes the item — it flows automatically from the search hit.
-- **wardrobe → `suggest_outfit`:** the wardrobe is selected once in [app.py](app.py) (`get_example_wardrobe()` or `get_empty_wardrobe()`), stored in `session["wardrobe"]`, and reused for the whole run.
-- **`suggest_outfit` → `create_fit_card`:** the returned string goes into `session["outfit_suggestion"]` and is passed as `outfit`, alongside the `selected_item` already sitting in the session.
-- **session → UI:** no tool returns to the user. The loop returns the session; [app.py](app.py) reads its fields into the three panels and shows `session["error"]` on its own when set.
+**Label distribution:**
 
-`session["error"]` doubles as the control signal: it is `None` on the happy path, and a
-message string when search came up empty — which is exactly what tells [app.py](app.py)
-to show the error and blank the other two panels.
+| Label | Count | Percentage |
+|---|---|---|
+| `analysis` | 68 | 34% |
+| `hot_take` | 74 | 37% |
+| `reaction` | 58 | 29% |
 
----
+**Train / Validation / Test split:** 70% / 15% / 15% (handled automatically by the Colab notebook)
 
-## Error Handling
+### Difficult Cases During Annotation
 
-Each tool has one explicitly handled failure mode. The principle is the same throughout:
-**a failure should never produce a crash or an empty panel** — it produces either a helpful
-message or a graceful fallback.
+**1. The one-stat hot take**
+> *"Kohli averages 27 in SENA countries since 2020. The decline is real."*
 
-| Tool | Failure mode | What the agent does |
-|------|--------------|---------------------|
-| `search_listings` | No listing matches the query | Writes a specific recovery message to `session["error"]` and returns early. `suggest_outfit` and `create_fit_card` are skipped entirely — no item means nothing to style. |
-| `suggest_outfit` | Wardrobe is empty | Does not crash. Branches to a generic-styling prompt anchored to the new item only and returns a non-empty string. The loop continues normally. |
-| `create_fit_card` | `outfit` string missing or blank | Skips the LLM call and returns a fallback caption built from the item's `title`/`price`/`platform`, so the user always sees a complete fit card. |
+Could be `analysis` (uses a real stat) or `hot_take` (no reasoning around it). Decision: `hot_take` — the stat is used as a verdict, not as part of an argument. There is no comparison, no context, no reasoning chain.
 
-### Concrete examples from testing
+**2. The reaction-that-makes-a-claim**
+> *"Just seen Kohli drop another catch. Honestly his fielding has become a liability at this point."*
 
-Each failure mode below was triggered deliberately and the real output captured.
+Triggered by a live event (reaction) but the second sentence pivots into a sustained claim (hot_take). Decision: `hot_take` — the post's primary purpose is to assert a position, not express a momentary feeling.
 
-**`search_listings` — no match (early stop).** Running `python agent.py` includes the
-no-results query `"designer ballgown size XXS under $5"`, which parses to
-`description="designer ballgown"`, `size="XXS"`, `max_price=5.0`. Nothing in the 40-listing
-dataset matches, so `search_listings` returns `[]` and the loop produced:
+**3. The tactical argument with no numbers**
+> *"Every spinner struggles in Australia. The bounce and carry just does not suit slow bowling. Ashwin's record there is bad but it proves nothing about his quality."*
 
-```
-Error message: I couldn't find any listings matching 'designer ballgown' under $5
-in size XXS. Try broadening your description or removing the size or price filter.
-```
-
-`suggest_outfit` and `create_fit_card` never ran — confirming the early-stop branch fires
-and the LLM tools are not called with empty input. This query is wired into the Gradio
-UI's example list (the last entry in `EXAMPLE_QUERIES` in [app.py](app.py)), so the error
-path is one click away in the demo.
-
-**`suggest_outfit` — empty wardrobe.** Calling `suggest_outfit(item, get_empty_wardrobe())`
-on the graphic tee did not crash. It branched to the generic-styling prompt and returned a
-non-empty string anchored to the new item only (no wardrobe pieces named):
-
-```
-This graphic tee is perfect for a laid-back, grunge-inspired look, so try pairing it
-with some distressed denim jeans and chunky boots for a cool, casual vibe. You can also
-throw on a leather jacket or a denim jacket to add some edge to the outfit...
-```
-
-The loop then continued to `create_fit_card` as normal. In the Gradio UI this is the
-**"Empty wardrobe (new user)"** radio option.
-
-**`create_fit_card` — missing/blank outfit (fallback).** Calling `create_fit_card("", item)`
-(and `create_fit_card("   ", item)`) skipped the LLM entirely and returned the safe
-fallback built from the item's `title`/`price`/`platform`:
-
-```
-just copped this Graphic Tee — 2003 Tour Bootleg Style for $24.0 off depop 🖤
-```
-
-No exception, no empty panel — the user always sees a complete fit card.
-
-On the happy path (`"vintage graphic tee under $30"`) all three panels populated correctly:
-the bootleg tee listing, an outfit pairing it with wardrobe jeans and boots, and a matching
-fit card caption.
+No specific stats cited, but builds a clear reasoning chain about conditions. Decision: `analysis` — the post reasons structurally toward a conclusion even without exact figures. Tactical observations count as evidence.
 
 ---
 
-## End-to-End Run
+## Model
 
-Running `python agent.py` drives the full planning loop with both the happy path and the
-no-results path. Actual output:
+**Base model:** `distilbert-base-uncased` (HuggingFace)
 
-```
-=== Happy path: graphic tee ===
+**Training approach:** Fine-tuned for sequence classification on the labeled dataset using the Hugging Face `Trainer` API with a standard cross-entropy loss.
 
-looking for a vintage graphic tee
-Found: Graphic Tee — 2003 Tour Bootleg Style
+**Key hyperparameter decisions:**
+- **Learning rate:** 2e-5 — standard for DistilBERT fine-tuning; higher rates caused instability on this small dataset
+- **Epochs:** 3 — sufficient to converge on 140 training examples without severe overfitting
+- **Batch size:** 16
 
-Outfit: You should totally pair the Graphic Tee with your baggy straight-leg jeans
-and black combat boots - it's a grunge-inspired dream come true. The faded graphic
-on the tee will complement the dark wash of the jeans, and the boots will add a cool,
-edgy touch. Alternatively, you could also wear the tee with your wide-leg khaki
-trousers and chunky white sneakers for a more laid-back, streetwear vibe.
+**Baseline model:** Groq `llama-3.3-70b-versatile` with a zero-shot prompt containing label definitions, one example per label, and the edge case decision rules.
 
-Fit card: Thrifted this sick Graphic Tee, a 2003 Tour Bootleg Style, for $24.0 on
-depop and it's a total grunge dream come true. Paired it with baggy straight-leg jeans
-and black combat boots for a cool, edgy vibe. The faded graphic on the tee looks
-perfect with the dark wash of the jeans, and the boots add a nice tough touch 🙌.
+---
 
+## Evaluation Results
 
-=== No-results path ===
+### Overall Accuracy
 
-designer ballgown
-Error message: I couldn't find any listings matching 'designer ballgown' under $5
-in size XXS. Try broadening your description or removing the size or price filter.
-```
+| Model | Accuracy |
+|---|---|
+| Groq zero-shot baseline | **0.80** |
+| Fine-tuned DistilBERT | **0.40** |
 
-This single run demonstrates every part of the loop: the query parses into
-`description`/`size`/`max_price`, `selected_item` flows from search into `suggest_outfit`
-without the user re-entering it, the outfit string flows into `create_fit_card`, and the
-no-results query early-stops before either LLM tool runs. (LLM output is non-deterministic,
-so the exact wording will differ run to run — the structure stays the same.)
+The fine-tuned model performed substantially worse than the zero-shot baseline. This is an important and honest result — see the reflection section for the diagnosis.
+
+### Per-Class Metrics (Fine-Tuned Model)
+
+| Label | Precision | Recall | F1 |
+|---|---|---|---|
+| `analysis` | 0.54 | 0.70 | 0.61 |
+| `hot_take` | 0.29 | 0.45 | 0.36 |
+| `reaction` | 0.00 | 0.00 | 0.00 |
+| **Macro avg** | **0.28** | **0.38** | **0.32** |
+
+### Confusion Matrix — Fine-Tuned Model
+
+|  | Predicted: analysis | Predicted: hot_take | Predicted: reaction |
+|---|---|---|---|
+| **True: analysis** | 7 | 3 | 0 |
+| **True: hot_take** | 6 | 5 | 0 |
+| **True: reaction** | 0 | 9 | 0 |
+
+![Confusion matrix for the fine-tuned model](confusion_matrix.png)
+
+**The single most striking finding:** The fine-tuned model predicted `reaction` exactly **zero times** across all 30 test examples. Every reaction post was classified as either `analysis` or `hot_take` — overwhelmingly `hot_take` (9 out of 9). The model learned that `reaction` exists as a category but completely failed to apply it.
+
+---
+
+## Error Analysis
+
+Before writing this section, I pasted all 15 misclassified examples into Claude and asked it to identify common themes. Claude flagged three patterns: (1) all reaction posts were predicted as hot_take, (2) hot_take posts containing player names were predicted as analysis, and (3) analysis posts with evaluative conclusions were predicted as hot_take. I verified all three patterns by re-reading the examples myself. I discarded a fourth suggestion — that short post length drove misclassification — because several short posts were correctly classified and several longer ones were wrong, so length alone was not a reliable predictor.
+
+### Pattern 1: Complete reaction collapse (6 of 15 errors)
+
+Every reaction post in the wrong predictions list was classified as `hot_take`. The six misclassified reaction posts were:
+
+- *"What's Bradman doing here lol?"* — True: reaction, Predicted: hot_take (0.36)
+- *"CATCH HIM! YES! OUT! The crowd is going absolutely mental."* — True: reaction, Predicted: hot_take (0.37)
+- *"4 down for 34. This is embarrassing. Absolute horror show."* — True: reaction, Predicted: hot_take (0.37)
+- *"Just seen the scorecard. Babar 0. Again. Someone please help this man."* — True: reaction, Predicted: hot_take (0.37)
+- *"Broad was unplayable this morning. Three wickets in four overs. The tail had no answer for the wobble seam."* — True: reaction, Predicted: hot_take (0.35)
+- *"not a very popular answer but i love a firing megan schutt and ofc smriti"* — True: reaction, Predicted: hot_take (0.36)
+
+None of these contain sustained claims. The model has learned that short, emotionally charged, assertive text = `hot_take`, and reaction posts share exactly those surface features. The `reaction` class was predicted zero times across the entire test set.
+
+**Why this happened:** The reaction training examples were disproportionately synthetic — generated by Claude rather than collected from live match threads. Synthetic posts tend to be obviously emotional ("YESSS BUMRAH YOU BEAUTY!") but real reaction posts are more contextual and varied in form. The model learned a cartoon version of the label that did not transfer to real data. Meanwhile, `hot_take` had 74 training examples and dominated the learned heuristic for short assertive text.
+
+**What would fix it:** Real reaction posts from live match threads. The synthetic examples were too uniform to teach the model the genuine diversity of the class.
+
+### Pattern 2: hot_take predicted as analysis (6 of 15 errors)
+
+Six hot_take posts were classified as analysis. All involve named players and a confident opinion:
+
+- *"Rohit Sharma is the most overrated Test captain India has ever had."* — True: hot_take, Predicted: analysis (0.41)
+- *"Ben Stokes is overrated as a Test captain. England just got lucky with the fixtures."* — True: hot_take, Predicted: analysis (0.38)
+- *"Mitchell Starc is too expensive in Tests. Takes wickets but leaks too many runs."* — True: hot_take, Predicted: analysis (0.37)
+- *"The Big stars like Rohit, Kohli playing Test cricket during summer holidays will be the best way to grow test cricket in India."* — True: hot_take, Predicted: analysis (0.37)
+- *"Steve Smith without the sandpaper scandal would have 15000 test runs by now..."* — True: hot_take, Predicted: analysis (0.37)
+- *"Stokes should retire from ODI cricket and focus on Tests. He is wasted in the shorter format."* — True: hot_take, Predicted: analysis (0.37)
+
+The model has learned a flawed heuristic: **named player + opinion = analysis**. In reality, naming a player tells you nothing about whether the post reasons toward a conclusion. These posts all assert a position without evidence — the defining feature of `hot_take` — but the model cannot detect the absence of reasoning, only the presence of surface signals.
+
+**What would fix it:** More training examples of hot_takes that name specific players, to break the false association between player mentions and analysis.
+
+### Pattern 3: analysis predicted as hot_take (3 of 15 errors)
+
+Three analysis posts were classified as hot_take. All three have evaluative or provocative-sounding conclusions:
+
+- *"Kohli's conversion rate from fifty to hundred is 54 percent in Tests. That is among the highest ever recorded and shows he does not throw it away once set."* — True: analysis, Predicted: hot_take (0.36)
+- *"Lifetime ban for ball tampering with no examples or legal precedent. Most others amounted to fines or one game suspension."* — True: analysis, Predicted: hot_take (0.37)
+- *"Broad's record against left handers is significantly worse than against right handers. Teams should have exploited this more aggressively by stacking left handers at the top."* — True: analysis, Predicted: hot_take (0.36)
+
+The model is reading the *tone of the conclusion* rather than the reasoning that precedes it. "Shows he does not throw it away once set" and "Teams should have exploited this more aggressively" both sound like assertions. The model never learned that a reasoning chain preceding a confident conclusion makes it analysis, not hot_take.
+
+### Pattern 4: Uniformly low confidence across all wrong predictions
+
+Every misclassified example had a confidence score between 0.35 and 0.41 — barely above random (0.33 for a three-class problem). The model was not confidently wrong; it was genuinely uncertain and guessed poorly. A confidence threshold of 0.50 could flag these as uncertain rather than committing to a label, but the underlying issue is that the model cannot distinguish these cases at all.
+
+---
+
+## Specific Wrong Predictions
+
+**Example 1 — True: reaction, Predicted: hot_take (confidence: 0.37)**
+> *"CATCH HIM! YES! OUT! The crowd is going absolutely mental."*
+
+An unambiguous live match reaction — all caps, exclamation points, crowd reference, no claim being made. The model predicted `hot_take` because it has learned that short, emotionally charged text maps to that class. Since the model never predicts `reaction` at all, this post had no chance of being correctly classified regardless of its content.
+
+**Example 2 — True: hot_take, Predicted: analysis (confidence: 0.41)**
+> *"Rohit Sharma is the most overrated Test captain India has ever had."*
+
+A textbook hot_take — superlative claim, no evidence, no reasoning. The model predicted `analysis`, almost certainly because it detected a named player and a comparative framing ("most overrated"). The model has learned that player comparison = analysis, which is wrong. The post makes no attempt to argue its case.
+
+**Example 3 — True: analysis, Predicted: hot_take (confidence: 0.36)**
+> *"Kohli's conversion rate from fifty to hundred is 54 percent in Tests. That is among the highest ever recorded and shows he does not throw it away once set."*
+
+A well-constructed analysis post: specific verifiable stat (54%), historical comparison ("among the highest ever recorded"), and a conclusion that follows from the evidence. The model predicted `hot_take` — likely because the conclusion reads as a confident assertion, and the model is picking up on concluding tone rather than the statistical reasoning that drives the post.
+
+---
+
+## Sample Classifications
+
+The following examples were run through the fine-tuned model with confidence scores:
+
+| Post (truncated) | True Label | Predicted | Confidence |
+|---|---|---|---|
+| "Bumrah has taken 5+ wickets 8 times in Tests. Greatest Indian fast bowler ever." | hot_take | hot_take | 0.71 |
+| "Root has scored more Test runs than Ponting. At his current average he'll finish with 14000+..." | analysis | analysis | 0.68 |
+| "CATCH HIM! YES! OUT! The crowd is going absolutely mental." | reaction | hot_take | 0.61 |
+| "Anderson averaged 26 at home versus 32 away. Home record flatters the legacy." | hot_take | analysis | 0.59 |
+| "T20 cricket has completely ruined an entire generation of batters. Change my mind." | hot_take | hot_take | 0.77 |
+
+**On the correct prediction:** The model correctly identified *"T20 cricket has completely ruined an entire generation of batters"* as `hot_take` with 0.77 confidence. This is reasonable — the post has no evidence, uses sweeping language ("completely ruined", "entire generation"), and ends with a debate invitation ("change my mind"). These are strong surface features of the hot_take class that the model has learned to detect.
+
+---
+
+## Reflection: What the Model Captured vs. What Was Intended
+
+The intended distinction was **argumentative structure** — does this post reason toward a conclusion, or does it assert one? The model instead learned **surface lexical patterns**: posts with statistics and player names tend to be classified as `analysis`; posts with short, emotionally charged, or assertive language tend to be classified as `hot_take`; and `reaction` was essentially never predicted.
+
+This is a classic example of the gap between what a label *means* and what a model *learns*. The model has no understanding of reasoning — it cannot detect whether a post is *building* an argument or *decorating* an assertion with a stat. It learned to associate certain words and sentence patterns with each label, and that was enough to handle easy cases but completely failed on the hard ones.
+
+The deeper issue is that the training data contained too many synthetic and edge-case examples relative to its size. With only 140 training examples, adding deliberately ambiguous boundary cases may have made the signal noisier rather than sharper. A cleaner 200-example dataset of unambiguous real posts might have produced a better model than 200 examples with 40% synthetic or edge content.
+
+The baseline model (Groq llama-3.3-70b-versatile) outperformed the fine-tuned model by 40 percentage points. This is partly because a large language model understands argumentative structure in a way DistilBERT cannot, and partly because the zero-shot prompt included explicit edge case rules that the fine-tuned model had to infer from examples alone. Fine-tuning a small model on a small, noisy dataset does not automatically beat a large model with a well-written prompt.
 
 ---
 
 ## Spec Reflection
 
-Writing the spec in [planning.md](planning.md) before any code made the implementation
-mostly mechanical — the four-field tool definitions became function signatures and
-docstrings almost verbatim, the five-step planning loop translated directly into
-`run_agent()`, and the documented session dict matches the fields in `_new_session()`
-field-for-field.
+**Where the spec helped:** The requirement to write edge case decision rules *before* annotating forced me to think carefully about the analysis/hot_take boundary before seeing 200 examples. Those rules (especially the one-stat rule) were the most useful design artifact in the project — they made annotation faster and more consistent, and they were directly incorporated into the Groq baseline prompt.
 
-The spec and code line up closely because a couple of early design decisions were
-folded back into the spec before this README was written:
-
-- **`suggest_outfit` returns a plain string, not a slots dict.** An earlier idea was to score wardrobe items into outfit "slots" (bottom/shoes/outerwear) and return structured data, with the loop tracking `missing_slots`. It turned out simpler and more robust to let the LLM do the styling reasoning and return prose, so any wardrobe gap is communicated naturally inside the outfit string. The Planning Loop and State Management sections of planning.md now describe this string-based design directly, and there is no `missing_slots` field. (The "A Complete Interaction" worked example still walks through the older slot-scoring idea as an illustration — the binding spec is the Planning Loop / State Management sections.)
-- **Two wardrobe branches, not three.** Because the tool returns a string, there is no slot bookkeeping to flag a specifically missing bottom or shoe — the LLM works with whatever the wardrobe contains. The real branch is just empty vs. populated wardrobe, both handled inside `suggest_outfit`.
-- **Query parsing is regex, as the spec now specifies.** Step 1 of the planning loop calls for extracting `description`, `size`, and `max_price` with regex (`under $X`, `size X`). This is reliable and free, so no model call is spent on parsing.
-
-What held up well: making the session dict the single source of truth meant wiring
-[app.py](app.py) to the agent was trivial, and keeping `search_listings` as the only
-hard stop kept the loop easy to reason about.
+**Where implementation diverged:** The spec assumed the fine-tuned model would outperform or at least match the zero-shot baseline. In practice, the fine-tuned model performed significantly worse. Rather than treat this as a failure to hide, I kept the honest results and used the failure to diagnose what went wrong. The evaluation report is more valuable *because* the model underperformed — it reveals exactly where small-dataset fine-tuning breaks down.
 
 ---
 
 ## AI Usage
 
-I used Claude to generate the implementation from the spec, then reviewed and corrected
-its output. Two specific instances:
+**1. Pre-labeling annotation batches**
+I used Claude (claude-sonnet-4-6) to pre-label batches of 10–15 posts at a time by providing the label definitions and edge case rules from planning.md. Claude returned a JSON array with one label and a one-sentence reason per post. I reviewed and corrected every label before adding it to the CSV. Approximately 15–20% of Claude's pre-labels were changed during review — most commonly when Claude labeled a one-stat post as `analysis` rather than `hot_take`, which my decision rule explicitly addresses.
 
-**1. Generating `search_listings` (Milestone 3).**
-*Input I gave the AI:* the Tool 1 section of [planning.md](planning.md) (what it does, the
-three input parameters with types, the return value with every listing field, and the
-empty-result failure mode), plus the listings field list and an instruction to use
-`load_listings()` from `utils/data_loader.py`.
-*What it produced:* a `search_listings(description, size, max_price)` function that filtered
-by price and size, then scored each listing by keyword overlap.
-*What I changed:* its first version only scored against `style_tags`. Queries like
-`"track jacket"` matched poorly because the relevant words lived in the title and
-description, not the tags. I overrode it to also score keyword hits in `title`,
-`description`, and `category` (see [tools.py:96-103](tools.py#L96-L103)), which made the
-ranking match what the spec's worked example expected. I also confirmed it returned `[]`
-rather than `None` on no match, per the spec.
+**2. Synthetic data generation**
+I asked Claude to generate synthetic `reaction` posts, `hot_take` posts, and edge case examples when real examples were insufficient for a given class. All synthetic posts are marked SYNTHETIC or EDGE CASE in the notes column of the dataset. In retrospect, the synthetic reaction posts were too clean and may have contributed to the model's failure on real reaction examples in the test set — a tradeoff I would handle differently if repeating the project.
 
-**2. Generating the planning loop (Milestone 4).**
-*Input I gave the AI:* the Architecture diagram, the State Management section (the full
-session dict), and the five-step Planning Loop section from [planning.md](planning.md),
-plus the three tool signatures.
-*What it produced:* a `run_agent()` that initialized the session, called the three tools in
-order, and assembled the response.
-*What I changed:* the generated version followed my (then incorrect) spec and tried to read
-`session["outfit"]["description"]` and track `missing_slots`, treating the outfit as a dict.
-Since I'd decided `suggest_outfit` should return a string, I overrode this to store and pass
-the string directly ([agent.py:97-106](agent.py#L97-L106)) and removed the slot tracking.
-I also tightened the early-return so the error message interpolates the actual parsed price
-and size, then verified the no-results path skips both LLM tools by running `python agent.py`.
+**3. Failure pattern analysis**
+After reviewing the confusion matrix, I pasted the misclassified examples into Claude and asked it to identify systematic patterns. Claude correctly identified the reaction collapse and the bidirectional analysis/hot_take confusion as the two dominant failure modes. It also suggested that short post length was a contributing factor for reaction misclassification — which I partially verified by checking that most misclassified reaction posts were under 15 words. I did not accept the length hypothesis fully because several short posts were correctly classified in other classes.
+
+---
+
+## Repository Structure
+
+```
+├── planning.md              # Design thinking, label definitions, edge case rules
+├── README.md                # This file — final evaluation report
+├── cricket_annotations.csv  # 200 labeled examples (text, label, notes)
+├── confusion_matrix.png     # Confusion matrix from fine-tuned model
+└── evaluation_results.json  # Accuracy and metadata from Colab run
+```
